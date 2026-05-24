@@ -36,6 +36,8 @@ class ControllerApp(app_manager.OSKenApp):
         self.hosts_by_mac = {}
         self.mac_by_ip = {}
         self.installed_mac_flows = {}
+        self.firewall = Firewall()
+        self.last_logged_paths = None
 
     @set_ev_cls(ofp_event.EventOFPSwitchFeatures, CONFIG_DISPATCHER)
     def switch_features_handler(self, ev):
@@ -59,6 +61,7 @@ class ControllerApp(app_manager.OSKenApp):
             flags=0,
             actions=actions)
         datapath.send_msg(mod)
+        self.firewall.install_rules(self.ofctls)
 
     @set_ev_cls(event.EventSwitchEnter)
     def handle_switch_add(self, ev):
@@ -69,6 +72,7 @@ class ControllerApp(app_manager.OSKenApp):
         self.datapaths[datapath.id] = datapath
         self.ofctls[datapath.id] = OfCtl.factory(datapath, self.logger)
         self.switches.add(datapath.id)
+        self.firewall.install_rules(self.ofctls)
         self._recompute_paths()
 
     @set_ev_cls(event.EventSwitchLeave)
@@ -331,6 +335,7 @@ class ControllerApp(app_manager.OSKenApp):
             for mac, host in self.hosts_by_mac.items()
             if host.get("ip")
         )
+        path_logs = []
         for src_ip, src_mac, src_host in hosts:
             for dst_ip, dst_mac, dst_host in hosts:
                 if src_mac == dst_mac:
@@ -339,8 +344,25 @@ class ControllerApp(app_manager.OSKenApp):
                                                   dst_host["dpid"])
                 if not path:
                     continue
-                full_path = [src_ip] + ["s%s" % dpid for dpid in path] + [dst_ip]
-                self.logger.info("Shortest path %s -> %s: %s, distance=%s",
-                                 src_ip, dst_ip, " -> ".join(full_path),
-                                 len(path) + 1)
+                full_path = (
+                    ["host_%s" % src_mac] +
+                    ["switch_%s" % dpid for dpid in path] +
+                    ["host_%s" % dst_mac]
+                )
+                path_logs.append((
+                    src_mac,
+                    dst_mac,
+                    len(path) + 1,
+                    " -> ".join(full_path)
+                ))
+
+        snapshot = tuple(path_logs)
+        if snapshot == self.last_logged_paths:
+            return
+        self.last_logged_paths = snapshot
+
+        for src_mac, dst_mac, distance, path_text in path_logs:
+            self.logger.info("The distance from host_%s to host_%s : %s",
+                             src_mac, dst_mac, distance)
+            self.logger.info("Path: %s", path_text)
     
