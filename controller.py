@@ -28,6 +28,26 @@ class ControllerApp(app_manager.OSKenApp):
     def __init__(self, *args, **kwargs):
         super(ControllerApp, self).__init__(*args, **kwargs)
 
+    @set_ev_cls(ofp_event.EventOFPSwitchFeatures, CONFIG_DISPATCHER)
+    def switch_features_handler(self, ev):
+        datapath = ev.msg.datapath
+        ofproto = datapath.ofproto
+        parser = datapath.ofproto_parser
+
+        match = parser.OFPMatch()
+        actions = [parser.OFPActionOutput(ofproto.OFPP_CONTROLLER)]
+        mod = parser.OFPFlowMod(
+            datapath=datapath,
+            match=match,
+            cookie=0,
+            command=ofproto.OFPFC_ADD,
+            idle_timeout=0,
+            hard_timeout=0,
+            priority=0,
+            flags=0,
+            actions=actions)
+        datapath.send_msg(mod)
+
     @set_ev_cls(event.EventSwitchEnter)
     def handle_switch_add(self, ev):
         """
