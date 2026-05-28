@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 import struct
+import time
 
 from os_ken.lib import addrconv
 from os_ken.lib.packet import packet
@@ -17,6 +18,7 @@ class Config():
     start_ip = '192.168.1.2' # 可修改，地址池起始地址
     end_ip = '192.168.1.100' # 可修改，地址池结束边界
     netmask = '255.255.255.0' # 可修改，子网掩码
+    lease_time = 86400 # 可修改，DHCP 租约时间，单位为秒
 
     # 可以使用以上属性配置 DHCP 服务器。
     # 也可以添加 lease_time 等属性来支持 bonus 功能。
@@ -29,19 +31,18 @@ class DHCPServer():
     netmask = Config.netmask
     dns = Config.dns
     server_ip = '192.168.1.1'
-    lease_time = 86400
+    lease_time = Config.lease_time
     allocated_ip = {}
+    ip_to_mac = {}
+    lease_expiration = {}
     next_ip = addrconv.ipv4.text_to_bin(start_ip)
 
     @classmethod
     def assemble_ack(cls, pkt, datapath, port):
         eth_pkt = pkt.get_protocol(ethernet.ethernet)
         dhcp_pkt = pkt.get_protocol(dhcp.dhcp)
-        client_ip = cls._get_client_ip(dhcp_pkt)
-        if client_ip is None:
-            client_ip = cls._allocate_ip(eth_pkt.src)
-        else:
-            cls._remember_ip(eth_pkt.src, client_ip)
+        requested_ip = cls._get_client_ip(dhcp_pkt)
+        client_ip = cls._allocate_ip(eth_pkt.src, requested_ip)
 
         ack_pkt = cls._assemble_reply(pkt, client_ip, dhcp.DHCP_ACK)
         return ack_pkt
@@ -136,27 +137,83 @@ class DHCPServer():
         return None
 
     @classmethod
-    def _allocate_ip(cls, mac_addr):
+    def _allocate_ip(cls, mac_addr, requested_ip=None):
+        cls._expire_leases()
+
         if mac_addr in cls.allocated_ip:
-            return cls.allocated_ip[mac_addr]
+            client_ip = cls.allocated_ip[mac_addr]
+            cls._renew_lease(mac_addr, client_ip)
+            return client_ip
 
-        current = cls._ip_to_int(cls.next_ip)
+        if requested_ip and cls._ip_available_for_mac(requested_ip, mac_addr):
+            cls._remember_ip(mac_addr, requested_ip)
+            return requested_ip
+
+        start = cls._ip_to_int(addrconv.ipv4.text_to_bin(cls.start_ip))
         end = cls._ip_to_int(addrconv.ipv4.text_to_bin(cls.end_ip))
-        if current >= end:
-            raise RuntimeError('No available DHCP address')
+        current = cls._ip_to_int(cls.next_ip)
+        if current < start or current >= end:
+            current = start
 
-        client_ip = addrconv.ipv4.bin_to_text(cls._int_to_ip(current))
-        cls.allocated_ip[mac_addr] = client_ip
-        cls.next_ip = cls._int_to_ip(current + 1)
-        return client_ip
+        pool_size = end - start
+        for offset in range(pool_size):
+            candidate = start + ((current - start + offset) % pool_size)
+            candidate_ip = addrconv.ipv4.bin_to_text(cls._int_to_ip(candidate))
+            if candidate_ip not in cls.ip_to_mac:
+                cls._remember_ip(mac_addr, candidate_ip)
+                next_offset = (candidate - start + 1) % pool_size
+                cls.next_ip = cls._int_to_ip(start + next_offset)
+                return candidate_ip
+
+        raise RuntimeError('No available DHCP address')
 
     @classmethod
     def _remember_ip(cls, mac_addr, client_ip):
+        if not cls._ip_in_pool(client_ip):
+            raise RuntimeError('Requested DHCP address is outside the address pool')
+
+        old_ip = cls.allocated_ip.get(mac_addr)
+        if old_ip and old_ip != client_ip:
+            cls.ip_to_mac.pop(old_ip, None)
+
+        owner = cls.ip_to_mac.get(client_ip)
+        if owner and owner != mac_addr:
+            raise RuntimeError('Requested DHCP address is already allocated')
+
         cls.allocated_ip[mac_addr] = client_ip
-        current = cls._ip_to_int(cls.next_ip)
-        requested = cls._ip_to_int(addrconv.ipv4.text_to_bin(client_ip))
-        if requested >= current:
-            cls.next_ip = cls._int_to_ip(requested + 1)
+        cls.ip_to_mac[client_ip] = mac_addr
+        cls._renew_lease(mac_addr, client_ip)
+
+    @classmethod
+    def _renew_lease(cls, mac_addr, client_ip):
+        cls.lease_expiration[mac_addr] = time.time() + cls.lease_time
+
+    @classmethod
+    def _expire_leases(cls):
+        now = time.time()
+        expired_macs = [
+            mac for mac, expires_at in cls.lease_expiration.items()
+            if expires_at <= now
+        ]
+        for mac in expired_macs:
+            client_ip = cls.allocated_ip.pop(mac, None)
+            cls.lease_expiration.pop(mac, None)
+            if client_ip and cls.ip_to_mac.get(client_ip) == mac:
+                cls.ip_to_mac.pop(client_ip, None)
+
+    @classmethod
+    def _ip_available_for_mac(cls, ip_addr, mac_addr):
+        if not cls._ip_in_pool(ip_addr):
+            return False
+        owner = cls.ip_to_mac.get(ip_addr)
+        return owner is None or owner == mac_addr
+
+    @classmethod
+    def _ip_in_pool(cls, ip_addr):
+        ip_int = cls._ip_to_int(addrconv.ipv4.text_to_bin(ip_addr))
+        start = cls._ip_to_int(addrconv.ipv4.text_to_bin(cls.start_ip))
+        end = cls._ip_to_int(addrconv.ipv4.text_to_bin(cls.end_ip))
+        return start <= ip_int < end
 
     @classmethod
     def _option_value_to_int(cls, value):

@@ -14,6 +14,7 @@ from os_ken.lib.packet import packet
 from os_ken.lib.packet import udp
 from dhcp import DHCPServer
 from collections import defaultdict
+import os
 import time
 from ofctl_utilis import OfCtl,OfCtl_v1_0,OfCtl_after_v1_2,VLANID_NONE
 import logging
@@ -26,6 +27,8 @@ class ControllerApp(app_manager.OSKenApp):
     OFP_VERSIONS = [ofproto_v1_0.OFP_VERSION]
     SWITCHING_COOKIE = 0x3055
     SWITCHING_PRIORITY = 100
+    DEFAULT_ROUTING_ALGORITHM = "dijkstra"
+    ROUTING_ALGORITHMS = ("dijkstra", "bellman_ford")
 
     def __init__(self, *args, **kwargs):
         super(ControllerApp, self).__init__(*args, **kwargs)
@@ -38,6 +41,7 @@ class ControllerApp(app_manager.OSKenApp):
         self.installed_mac_flows = {}
         self.firewall = Firewall()
         self.last_logged_paths = None
+        self.routing_algorithm = self._select_routing_algorithm()
 
     @set_ev_cls(ofp_event.EventOFPSwitchFeatures, CONFIG_DISPATCHER)
     def switch_features_handler(self, ev):
@@ -224,7 +228,26 @@ class ControllerApp(app_manager.OSKenApp):
         self.links[src_dpid].pop(dst_dpid, None)
         self.links[dst_dpid].pop(src_dpid, None)
 
+    def _select_routing_algorithm(self):
+        algorithm = os.environ.get(
+            "CS305_ROUTING_ALGORITHM",
+            self.DEFAULT_ROUTING_ALGORITHM
+        ).lower()
+        if algorithm not in self.ROUTING_ALGORITHMS:
+            self.logger.warning(
+                "Unknown routing algorithm %s, fallback to %s",
+                algorithm,
+                self.DEFAULT_ROUTING_ALGORITHM
+            )
+            return self.DEFAULT_ROUTING_ALGORITHM
+        return algorithm
+
     def _shortest_switch_path(self, src_dpid, dst_dpid):
+        if self.routing_algorithm == "bellman_ford":
+            return self._bellman_ford_switch_path(src_dpid, dst_dpid)
+        return self._dijkstra_switch_path(src_dpid, dst_dpid)
+
+    def _dijkstra_switch_path(self, src_dpid, dst_dpid):
         if src_dpid == dst_dpid:
             return [src_dpid]
         queue = [(0, src_dpid, [src_dpid])]
@@ -242,6 +265,49 @@ class ControllerApp(app_manager.OSKenApp):
                     heapq.heappush(queue, (distance + 1, neighbor,
                                            path + [neighbor]))
         return None
+
+    def _bellman_ford_switch_path(self, src_dpid, dst_dpid):
+        if src_dpid == dst_dpid:
+            return [src_dpid]
+
+        nodes = set(self.switches)
+        for src, neighbors in self.links.items():
+            nodes.add(src)
+            nodes.update(neighbors.keys())
+
+        if src_dpid not in nodes or dst_dpid not in nodes:
+            return None
+
+        distance = {dpid: float("inf") for dpid in nodes}
+        previous = {}
+        distance[src_dpid] = 0
+
+        edges = []
+        for src in sorted(self.links):
+            for dst in sorted(self.links[src]):
+                edges.append((src, dst))
+
+        for _ in range(max(len(nodes) - 1, 0)):
+            updated = False
+            for src, dst in edges:
+                if distance[src] + 1 < distance[dst]:
+                    distance[dst] = distance[src] + 1
+                    previous[dst] = src
+                    updated = True
+            if not updated:
+                break
+
+        if distance[dst_dpid] == float("inf"):
+            return None
+
+        path = [dst_dpid]
+        while path[-1] != src_dpid:
+            parent = previous.get(path[-1])
+            if parent is None:
+                return None
+            path.append(parent)
+        path.reverse()
+        return path
 
     def _recompute_paths(self):
         desired_flows = {}
@@ -356,10 +422,13 @@ class ControllerApp(app_manager.OSKenApp):
                     " -> ".join(full_path)
                 ))
 
-        snapshot = tuple(path_logs)
+        snapshot = (self.routing_algorithm, tuple(path_logs))
         if snapshot == self.last_logged_paths:
             return
         self.last_logged_paths = snapshot
+
+        if path_logs:
+            self.logger.info("Routing algorithm: %s", self.routing_algorithm)
 
         for src_mac, dst_mac, distance, path_text in path_logs:
             self.logger.info("The distance from host_%s to host_%s : %s",
