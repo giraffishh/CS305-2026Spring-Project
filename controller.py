@@ -24,27 +24,41 @@ from firewall import Firewall
 
 
 class ControllerApp(app_manager.OSKenApp):
+    # 指定当前控制器支持的 OpenFlow 版本。
     OFP_VERSIONS = [ofproto_v1_0.OFP_VERSION]
+    # 下发二层转发流表时使用的 cookie，用于后续区分和删除。
     SWITCHING_COOKIE = 0x3055
+    # 二层转发规则的优先级，高于默认 table-miss。
     SWITCHING_PRIORITY = 100
+    # 默认最短路算法，可通过环境变量覆盖。
     DEFAULT_ROUTING_ALGORITHM = "dijkstra"
     ROUTING_ALGORITHMS = ("dijkstra", "bellman_ford")
 
     def __init__(self, *args, **kwargs):
         super(ControllerApp, self).__init__(*args, **kwargs)
+        # 维护当前在线交换机 datapath 对象，key 为交换机 dpid。
         self.datapaths = {}
+        # 为每台交换机缓存对应的 OfCtl 封装，便于统一下发流表或报文。
         self.ofctls = {}
+        # 记录当前拓扑中已知的交换机集合。
         self.switches = set()
+        # 邻接表形式的链路视图：links[src_dpid][dst_dpid] = src_port。
         self.links = defaultdict(dict)
+        # 主机学习表：MAC -> {dpid, port, ip}。
         self.hosts_by_mac = {}
+        # ARP 学到的 IP/MAC 映射，用于快速响应 ARP 请求。
         self.mac_by_ip = {}
+        # 已安装的目的 MAC 转发表项，避免重复下发。
         self.installed_mac_flows = {}
         self.firewall = Firewall()
+        # 保存上一次打印的路径快照，避免日志重复刷屏。
         self.last_logged_paths = None
+        # 根据环境变量选择路径算法。
         self.routing_algorithm = self._select_routing_algorithm()
 
     @set_ev_cls(ofp_event.EventOFPSwitchFeatures, CONFIG_DISPATCHER)
     def switch_features_handler(self, ev):
+        # 交换机刚连接控制器时，下发 table-miss，将未知报文送到控制器。
         datapath = ev.msg.datapath
         ofproto = datapath.ofproto
         parser = datapath.ofproto_parser
@@ -65,6 +79,7 @@ class ControllerApp(app_manager.OSKenApp):
             flags=0,
             actions=actions)
         datapath.send_msg(mod)
+        # 在交换机初始化完成后同步安装防火墙规则。
         self.firewall.install_rules(self.ofctls)
 
     @set_ev_cls(event.EventSwitchEnter)
@@ -72,6 +87,7 @@ class ControllerApp(app_manager.OSKenApp):
         """
         Event handler indicating a switch has come online.
         """
+        # 新交换机加入时更新本地拓扑缓存，并重新计算转发路径。
         datapath = ev.switch.dp
         self.datapaths[datapath.id] = datapath
         self.ofctls[datapath.id] = OfCtl.factory(datapath, self.logger)
@@ -84,6 +100,7 @@ class ControllerApp(app_manager.OSKenApp):
         """
         Event handler indicating a switch has been removed
         """
+        # 交换机离线后清理相关状态，避免保留失效链路和主机信息。
         dpid = ev.switch.dp.id
         self.switches.discard(dpid)
         self.datapaths.pop(dpid, None)
@@ -108,6 +125,7 @@ class ControllerApp(app_manager.OSKenApp):
         Event handler indiciating a host has joined the network
         This handler is automatically triggered when a host sends an ARP response.
         """ 
+        # 主机接入后记录其接入交换机、端口和 IP，并刷新全网转发表。
         host = ev.host
         if not host.port:
             return
@@ -120,6 +138,7 @@ class ControllerApp(app_manager.OSKenApp):
         """
         Event handler indicating a link between two switches has been added
         """
+        # 链路加入后更新双向邻接关系。
         link = ev.link
         self._add_link(link.src.dpid, link.dst.dpid,
                        link.src.port_no, link.dst.port_no)
@@ -130,6 +149,7 @@ class ControllerApp(app_manager.OSKenApp):
         """
         Event handler indicating when a link between two switches has been deleted
         """
+        # 链路删除后从邻接表中移除，并重新下发可达路径。
         link = ev.link
         self._remove_link(link.src.dpid, link.dst.dpid)
         self._recompute_paths()
@@ -142,6 +162,7 @@ class ControllerApp(app_manager.OSKenApp):
         Event handler for when any switch port changes state.
         This includes links for hosts as well as links between switches.
         """
+        # 端口状态变化可能影响主机连通性或链路状态，因此统一触发重算。
         self._recompute_paths()
 
 
@@ -149,6 +170,7 @@ class ControllerApp(app_manager.OSKenApp):
     @set_ev_cls(ofp_event.EventOFPPacketIn, MAIN_DISPATCHER)
     def packet_in_handler(self, ev):
         try:
+            # table-miss 上送的报文在这里统一处理，目前主要区分 DHCP 与非 DHCP。
             msg = ev.msg
             datapath = msg.datapath
             pkt = packet.Packet(data=msg.data)
@@ -163,15 +185,18 @@ class ControllerApp(app_manager.OSKenApp):
             self.logger.error(e)
 
     def _handle_non_dhcp_packet(self, datapath, in_port, pkt, msg_data):
+        # 当前仅对 ARP 报文进行额外处理，其余报文依赖预装流表转发。
         pkt_arp = pkt.get_protocol(arp.arp)
         pkt_eth = pkt.get_protocol(ethernet.ethernet)
         if pkt_arp and pkt_eth:
             self._handle_arp(datapath, in_port, pkt_arp, pkt_eth)
 
     def _handle_arp(self, datapath, in_port, pkt_arp, pkt_eth):
+        # 无论请求还是响应，先借助 ARP 源信息学习主机位置。
         self._learn_host(pkt_arp.src_mac, datapath.id, in_port, pkt_arp.src_ip)
 
         if pkt_arp.opcode == arp.ARP_REPLY:
+            # 收到 ARP 响应说明主机已经活跃，可据此重算路径。
             self._recompute_paths()
             return
 
@@ -185,6 +210,7 @@ class ControllerApp(app_manager.OSKenApp):
             return
 
         ofctl = self._get_ofctl(datapath)
+        # 若已知目标 IP 对应的 MAC，则由控制器直接代答 ARP。
         ofctl.send_arp(
             arp.ARP_REPLY,
             VLANID_NONE,
@@ -200,6 +226,7 @@ class ControllerApp(app_manager.OSKenApp):
         self._recompute_paths()
 
     def _get_ofctl(self, datapath):
+        # 延迟初始化 OfCtl，确保任意已知 datapath 都能被统一操作。
         if datapath.id not in self.ofctls:
             self.datapaths[datapath.id] = datapath
             self.ofctls[datapath.id] = OfCtl.factory(datapath, self.logger)
@@ -207,6 +234,7 @@ class ControllerApp(app_manager.OSKenApp):
         return self.ofctls[datapath.id]
 
     def _learn_host(self, mac, dpid, port_no, ip_addr=None):
+        # 更新主机位置；如果主机迁移到新端口，这里会直接覆盖旧记录。
         if not mac:
             return
         self.switches.add(dpid)
@@ -219,16 +247,19 @@ class ControllerApp(app_manager.OSKenApp):
             self.mac_by_ip[ip_addr] = mac
 
     def _add_link(self, src_dpid, dst_dpid, src_port, dst_port):
+        # 控制器内部使用无向图表示交换机之间链路，因此双向写入。
         self.switches.add(src_dpid)
         self.switches.add(dst_dpid)
         self.links[src_dpid][dst_dpid] = src_port
         self.links[dst_dpid][src_dpid] = dst_port
 
     def _remove_link(self, src_dpid, dst_dpid):
+        # 删除链路时同样要清除双向邻接信息。
         self.links[src_dpid].pop(dst_dpid, None)
         self.links[dst_dpid].pop(src_dpid, None)
 
     def _select_routing_algorithm(self):
+        # 允许通过环境变量切换最短路算法，便于实验对比。
         algorithm = os.environ.get(
             "CS305_ROUTING_ALGORITHM",
             self.DEFAULT_ROUTING_ALGORITHM
@@ -243,11 +274,13 @@ class ControllerApp(app_manager.OSKenApp):
         return algorithm
 
     def _shortest_switch_path(self, src_dpid, dst_dpid):
+        # 根据配置分派到对应的最短路径算法实现。
         if self.routing_algorithm == "bellman_ford":
             return self._bellman_ford_switch_path(src_dpid, dst_dpid)
         return self._dijkstra_switch_path(src_dpid, dst_dpid)
 
     def _dijkstra_switch_path(self, src_dpid, dst_dpid):
+        # 在无权图中使用 Dijkstra，等价于按跳数寻找最短路径。
         if src_dpid == dst_dpid:
             return [src_dpid]
         queue = [(0, src_dpid, [src_dpid])]
@@ -267,6 +300,7 @@ class ControllerApp(app_manager.OSKenApp):
         return None
 
     def _bellman_ford_switch_path(self, src_dpid, dst_dpid):
+        # Bellman-Ford 版本同样按单位边权计算，便于和 Dijkstra 做实验对照。
         if src_dpid == dst_dpid:
             return [src_dpid]
 
@@ -310,6 +344,7 @@ class ControllerApp(app_manager.OSKenApp):
         return path
 
     def _recompute_paths(self):
+        # 根据当前拓扑和主机学习结果，重新整理每台交换机的目的 MAC 转发规则。
         desired_flows = {}
         for dst_mac, dst_host in list(self.hosts_by_mac.items()):
             for src_dpid in list(self.switches):
@@ -325,6 +360,7 @@ class ControllerApp(app_manager.OSKenApp):
             dpid, dst_mac = key
             if key in desired_flows:
                 continue
+            # 如果某条旧规则已经不再需要，则主动删除，避免错误转发。
             datapath = self.datapaths.get(dpid)
             if datapath:
                 self._delete_mac_flow(datapath, dst_mac)
@@ -338,6 +374,7 @@ class ControllerApp(app_manager.OSKenApp):
         self._log_host_paths()
 
     def _output_port_to_host(self, src_dpid, dst_host):
+        # 计算从源交换机前往目标主机时，第一跳应该走哪个端口。
         dst_dpid = dst_host["dpid"]
         if src_dpid == dst_dpid:
             return dst_host["port"]
@@ -348,6 +385,7 @@ class ControllerApp(app_manager.OSKenApp):
         return self.links[src_dpid].get(path[1])
 
     def _install_mac_flow(self, datapath, dst_mac, out_port):
+        # 为“目的 MAC -> 输出端口”安装二层转发表项。
         key = (datapath.id, dst_mac)
         if self.installed_mac_flows.get(key) == out_port:
             return
@@ -366,6 +404,7 @@ class ControllerApp(app_manager.OSKenApp):
         self.installed_mac_flows[key] = out_port
 
     def _delete_mac_flow(self, datapath, dst_mac):
+        # 删除指定交换机上匹配目标 MAC 的旧流表项。
         ofp = datapath.ofproto
         parser = datapath.ofproto_parser
         match = parser.OFPMatch(
@@ -396,6 +435,7 @@ class ControllerApp(app_manager.OSKenApp):
         datapath.send_msg(mod)
 
     def _log_host_paths(self):
+        # 打印主机对之间的路径和距离，便于观察当前算法下的转发结果。
         hosts = sorted(
             (host["ip"], mac, host)
             for mac, host in self.hosts_by_mac.items()

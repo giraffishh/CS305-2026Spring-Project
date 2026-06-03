@@ -60,10 +60,12 @@ class OfCtl(object):
     To use, create an OfCtl object by calling Ofctl.factory with a the datapath object returned by
     a switch event.
     """
+    # 按 OpenFlow 版本保存对应的控制器实现类，便于运行时动态分发。
     _OF_VERSIONS = {}
 
     @staticmethod
     def register_of_version(version):
+        # 装饰器：把某个版本号与具体实现类注册起来。
         def _register_of_version(cls):
             OfCtl._OF_VERSIONS.setdefault(version, cls)
             return cls
@@ -77,6 +79,7 @@ class OfCtl(object):
         dp       -- Switch datapath object
         logger   -- RyuApp logger instance
         """
+        # 根据交换机 datapath 暴露的协议版本，实例化对应的控制器对象。
         of_version = dp.ofproto.OFP_VERSION
         if of_version in OfCtl._OF_VERSIONS:
             ofctl = OfCtl._OF_VERSIONS[of_version](dp, logger)
@@ -88,6 +91,7 @@ class OfCtl(object):
     def __init__(self, dp, logger):
         super(OfCtl, self).__init__()
         self.dp = dp
+        # 保存交换机 ID，后续日志输出时可直接附带上下文。
         self.sw_id = {'sw_id': dpid_lib.dpid_to_str(dp.id)}
         self.logger = logger
 
@@ -156,6 +160,7 @@ class OfCtl(object):
         output_port   -- Outgoing port number to send message
         """
 
+        # 如果指定了 VLAN，就先封装 802.1Q 头，再封装 ARP。
         if vlan_id != VLANID_NONE:
             ether_proto = ether.ETH_TYPE_8021Q
             pcp = 0
@@ -169,6 +174,7 @@ class OfCtl(object):
         hlen = 6
         plen = 4
 
+        # 按“以太网头 -> VLAN头(可选) -> ARP负载”的顺序组包。
         pkt = packet.Packet()
         e = ethernet.ethernet(dst_mac, sender_mac, ether_proto)
         a = arp.arp(hwtype, arp_proto, hlen, plen, arp_opcode,
@@ -184,11 +190,12 @@ class OfCtl(object):
 
     def send_icmp(self, in_port, protocol_list, vlan_id, icmp_type,
                   icmp_code, icmp_data=None, msg_data=None, src_ip=None):
-        # Generate ICMP reply packet
+        # 生成 ICMP 应答或差错报文。
         csum = 0
         offset = ethernet.ethernet._MIN_LEN
 
         if vlan_id != VLANID_NONE:
+            # 带 VLAN 的报文在截取原始 IP 数据时需要额外跳过 VLAN 头长度。
             ether_proto = ether.ETH_TYPE_8021Q
             pcp = 0
             cfi = 0
@@ -199,11 +206,13 @@ class OfCtl(object):
             ether_proto = ether.ETH_TYPE_IP
 
         eth = protocol_list[ETHERNET]
+        # 以太网层源/目的地址与原报文相反，用于回送到发送方。
         e = ethernet.ethernet(eth.src, eth.dst, ether_proto)
 
         ip = protocol_list[IPV4]
 
         if icmp_data is None and msg_data is not None:
+            # 未显式提供 ICMP 负载时，从触发错误的原始报文中截取必要字段。
             # RFC 4884 says that we should send "at least 128 octets"
             # if we are using the ICMP Extension Structure.
             # We're not using the extension structure, but let's send
@@ -234,6 +243,7 @@ class OfCtl(object):
 
         if src_ip is None:
             src_ip = ip.dst
+        # 重新计算返回 IPv4 报文的总长度。
         ip_total_length = ip.header_length * 4 + ic._MIN_LEN
         if ic.data is not None:
             ip_total_length += ic.data._MIN_LEN
@@ -257,6 +267,7 @@ class OfCtl(object):
                              pkt.data, data_str=str(pkt))
 
     def send_packet_out(self, in_port, output, data, data_str=None):
+        # 通过 PacketOut 直接把构造好的二进制报文从指定端口发出去。
         actions = [self.dp.ofproto_parser.OFPActionOutput(output, 0)]
         self.dp.send_packet_out(buffer_id=UINT32_MAX, in_port=in_port,
                                 actions=actions, data=data)
@@ -266,12 +277,14 @@ class OfCtl(object):
         # self.logger.debug('Packet out = %s', data_str, extra=self.sw_id)
 
     def set_normal_flow(self, cookie, priority):
+        # 下发“正常二层转发”规则，交由交换机常规转发表处理。
         out_port = self.dp.ofproto.OFPP_NORMAL
         actions = [self.dp.ofproto_parser.OFPActionOutput(out_port, 0)]
         self.set_flow(cookie, priority, actions=actions)
 
     def set_packetin_flow(self, cookie, priority, dl_type=0, dl_dst=0,
                           dl_vlan=0, dst_ip=0, dst_mask=32, nw_proto=0):
+        # 命中该流表项的报文会上送控制器，用于进一步软件处理。
         miss_send_len = UINT16_MAX
         actions = [self.dp.ofproto_parser.OFPActionOutput(
             self.dp.ofproto.OFPP_CONTROLLER, miss_send_len)]
@@ -280,6 +293,7 @@ class OfCtl(object):
                       nw_proto=nw_proto, actions=actions)
 
     def send_stats_request(self, stats, waiters):
+        # 通过 xid 把一次统计请求与对应的异步响应关联起来。
         self.dp.set_xid(stats)
         waiters_per_dp = waiters.setdefault(self.dp.id, {})
         event = hub.Event()
@@ -308,6 +322,7 @@ class OfCtl_v1_0(OfCtl):
         ofp = self.dp.ofproto
         ofp_parser = self.dp.ofproto_parser
 
+        # OpenFlow 1.0 通过全通配 match 拉取整张流表。
         match = ofp_parser.OFPMatch(ofp.OFPFW_ALL, 0, 0, 0,
                                     0, 0, 0, 0, 0, 0, 0, 0, 0)
         stats = ofp_parser.OFPFlowStatsRequest(self.dp, 0, match,
@@ -323,6 +338,7 @@ class OfCtl_v1_0(OfCtl):
         ofp_parser = self.dp.ofproto_parser
         cmd = ofp.OFPFC_ADD
 
+        # 1.0 版本使用 wildcard 位图描述哪些字段参与匹配。
         wildcards = ofp.OFPFW_ALL
 
         if dl_type:
@@ -355,6 +371,7 @@ class OfCtl_v1_0(OfCtl):
         if tp_dst:
             wildcards &= ~ofp.OFPFW_TP_DST
 
+        # 组装 1.0 风格的 OFPMatch。
         match = ofp_parser.OFPMatch(
             wildcards,
             0,          # in_port
@@ -373,6 +390,7 @@ class OfCtl_v1_0(OfCtl):
 
         actions = actions or []
 
+        # 向交换机发送添加流表项的 FlowMod。
         m = ofp_parser.OFPFlowMod(
             self.dp,
             match,
@@ -391,6 +409,7 @@ class OfCtl_v1_0(OfCtl):
 
         ofp_parser = self.dp.ofproto_parser
 
+        # OpenFlow 1.0 删除规则主要依赖 match，而不是 cookie。
         flow_mod = self.dp.ofproto_parser.OFPFlowMod(
             self.dp, match=match, cookie=cookie, command=cmd, priority=priority, actions=actions)
         self.dp.send_msg(flow_mod)
@@ -405,6 +424,7 @@ class OfCtl_after_v1_2(OfCtl):
         pass
 
     def get_packetin_inport(self, msg):
+        # 1.2 及以后版本需要从 OXM match 字段中解析入端口。
         in_port = self.dp.ofproto.OFPP_ANY
         for match_field in msg.match.fields:
             if match_field.header == self.dp.ofproto.OXM_OF_IN_PORT:
@@ -422,7 +442,7 @@ class OfCtl_after_v1_2(OfCtl):
         ofp_parser = self.dp.ofproto_parser
         cmd = ofp.OFPFC_ADD
 
-        # Match
+        # 1.2+ 版本直接按字段逐项构造 match。
         match = ofp_parser.OFPMatch()
         if dl_type:
             match.set_dl_type(dl_type)
@@ -442,7 +462,7 @@ class OfCtl_after_v1_2(OfCtl):
             elif dl_type == ether.ETH_TYPE_ARP:
                 match.set_arp_opcode(nw_proto)
 
-        # Instructions
+        # 动作需要封装进 instruction，再一并写入 FlowMod。
         actions = actions or []
         inst = [ofp_parser.OFPInstructionActions(ofp.OFPIT_APPLY_ACTIONS,
                                                  actions)]
@@ -461,6 +481,7 @@ class OfCtl_after_v1_2(OfCtl):
         dl_type = ether.ETH_TYPE_IP
 
         actions = []
+        # 路由场景下可选地减 TTL，并重写二层源/目的 MAC。
         if dec_ttl:
             actions.append(ofp_parser.OFPActionDecNwTtl())
         if src_mac:
@@ -483,6 +504,7 @@ class OfCtl_after_v1_2(OfCtl):
             match = ofp_parser.OFPMatch()
 
         cmd = ofp.OFPFC_DELETE
+        # 用全 1 mask 表示精确匹配指定 cookie。
         cookie_mask = UINT64_MAX
         inst = []
 
@@ -551,6 +573,7 @@ class OfCtl_v1_3(OfCtl_after_v1_2):
 
 
 def ip_addr_aton(ip_str, err_msg=None):
+    # 校验 IPv4 字符串是否合法，并统一转换为标准文本格式。
     try:
         return addrconv.ipv4.bin_to_text(socket.inet_aton(ip_str))
     except (struct.error, socket.error) as e:
@@ -564,6 +587,7 @@ def ip_addr_ntoa(ip):
 
 
 def mask_ntob(mask, err_msg=None):
+    # 把前缀长度转换为 32 位整数形式的子网掩码。
     try:
         return (UINT32_MAX << (32 - mask)) & UINT32_MAX
     except ValueError:
@@ -576,6 +600,7 @@ def mask_ntob(mask, err_msg=None):
 def ipv4_apply_mask(address, prefix_len, err_msg=None):
     assert isinstance(address, str)
 
+    # 将 IP 地址与前缀长度组合，得到对应网段地址。
     address_int = ipv4_text_to_int(address)
     return ipv4_int_to_text(address_int & mask_ntob(prefix_len, err_msg))
 
@@ -589,10 +614,12 @@ def ipv4_text_to_int(ip_text):
     if ip_text == 0:
         return ip_text
     assert isinstance(ip_text, str)
+    # 把点分十进制 IPv4 地址转换为无符号整数，便于位运算。
     return struct.unpack('!I', addrconv.ipv4.text_to_bin(ip_text))[0]
 
 
 def nw_addr_aton(nw_addr, err_msg=None):
+    # 解析形如 "192.168.1.0/24" 的网段字符串，返回网段、掩码和原始地址。
     ip_mask = nw_addr.split('/')
     default_route = ip_addr_aton(ip_mask[0], err_msg=err_msg)
     netmask = 32
