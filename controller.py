@@ -406,7 +406,7 @@ class ControllerApp(app_manager.OSKenApp):
 
     def _recompute_paths(self):
         # 根据当前拓扑和主机学习结果，重新整理每台交换机的目的 MAC 转发规则。
-        desired_flows = {} # 流标格式： (dpid, dst_mac) -> out_port
+        desired_flows = {} # 流表格式： (dpid, dst_mac) -> out_port
         for dst_mac, dst_host in list(self.hosts_by_mac.items()):
             for src_dpid in list(self.switches):
                 datapath = self.datapaths.get(src_dpid)
@@ -497,6 +497,8 @@ class ControllerApp(app_manager.OSKenApp):
 
     def _log_host_paths(self):
         # 打印主机对之间的路径和距离，便于观察当前算法下的转发结果。
+        # 日志使用 IP/MAC/接入端口组合标识主机，这样在 Mininet CLI 中执行
+        # link up/down 后，可以直接看出路径是否绕开了故障链路。
         hosts = sorted(
             (host["ip"], mac, host)
             for mac, host in self.hosts_by_mac.items()
@@ -507,20 +509,30 @@ class ControllerApp(app_manager.OSKenApp):
             for dst_ip, dst_mac, dst_host in hosts:
                 if src_mac == dst_mac:
                     continue
+
+                src_label = self._format_host_label(src_ip, src_mac, src_host)
+                dst_label = self._format_host_label(dst_ip, dst_mac, dst_host)
                 path = self._shortest_switch_path(src_host["dpid"],
                                                   dst_host["dpid"])
                 if not path:
+                    path_logs.append((
+                        src_label,
+                        dst_label,
+                        "UNREACHABLE",
+                        "%s -> X -> %s" % (src_label, dst_label)
+                    ))
                     continue
-                full_path = (
-                    ["host_%s" % src_mac] +
-                    ["switch_%s" % dpid for dpid in path] +
-                    ["host_%s" % dst_mac]
+
+                path_text = " -> ".join(
+                    [src_label] +
+                    ["s%s" % dpid for dpid in path] +
+                    [dst_label]
                 )
                 path_logs.append((
-                    src_mac,
-                    dst_mac,
-                    len(path) + 1,
-                    " -> ".join(full_path)
+                    src_label,
+                    dst_label,
+                    "%s edges" % (len(path) + 1),
+                    path_text
                 ))
 
         snapshot = (self.routing_algorithm, tuple(path_logs))
@@ -528,11 +540,22 @@ class ControllerApp(app_manager.OSKenApp):
             return
         self.last_logged_paths = snapshot
 
-        if path_logs:
-            self.logger.info("Routing algorithm: %s", self.routing_algorithm)
+        if not path_logs:
+            return
 
-        for src_mac, dst_mac, distance, path_text in path_logs:
-            self.logger.info("The distance from host_%s to host_%s : %s",
-                             src_mac, dst_mac, distance)
-            self.logger.info("Path: %s", path_text)
+        self.logger.info("=== Shortest path table: algorithm=%s, hosts=%s ===",
+                         self.routing_algorithm, len(hosts))
+        for src_label, dst_label, distance_text, path_text in path_logs:
+            self.logger.info("%s -> %s | %s", src_label, dst_label,
+                             distance_text)
+            self.logger.info("  path: %s", path_text)
+        self.logger.info("=== End shortest path table ===")
+
+    def _format_host_label(self, ip_addr, mac_addr, host):
+        return "%s/%s@s%s:p%s" % (
+            ip_addr,
+            mac_addr,
+            host["dpid"],
+            host["port"]
+        )
     
