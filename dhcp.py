@@ -1,4 +1,5 @@
 # -*- coding: utf-8 -*-
+import logging
 import struct
 import time
 
@@ -32,6 +33,7 @@ class DHCPServer():
     """
 
     # DHCP 回复包中使用的服务器参数。
+    logger = logging.getLogger('DHCPServer')
     hardware_addr = Config.controller_macAddr
     start_ip = Config.start_ip
     end_ip = Config.end_ip
@@ -106,10 +108,16 @@ class DHCPServer():
         if msg_type == dhcp.DHCP_DISCOVER:
             # 客户端广播 DISCOVER，服务器返回 OFFER。
             cls._send_packet(datapath, port, cls.assemble_offer(pkt, datapath))
+            offer_pkt = cls.assemble_offer(pkt, datapath)
+            if offer_pkt is None:
+                cls._log_pool_exhausted(pkt)
+                offer_pkt = cls.assemble_nak(pkt)
+            cls._send_packet(datapath, port, offer_pkt)
         elif msg_type == dhcp.DHCP_REQUEST:
             # 客户端确认想使用某个 IP。合法则 ACK，否则 NAK。
             ack_pkt = cls.assemble_ack(pkt, datapath, port)
             if ack_pkt is None:
+                cls._log_pool_exhausted(pkt)
                 ack_pkt = cls.assemble_nak(pkt)
             cls._send_packet(datapath, port, ack_pkt)
         elif msg_type == getattr(dhcp, 'DHCP_RELEASE', 7):
@@ -118,6 +126,17 @@ class DHCPServer():
         elif msg_type == getattr(dhcp, 'DHCP_DECLINE', 4):
             # 客户端认为该 IP 冲突，服务器删除租约并暂时屏蔽该 IP。
             cls._decline_requested_ip(pkt)
+
+    @classmethod
+    def _log_pool_exhausted(cls, pkt):
+        eth_pkt = pkt.get_protocol(ethernet.ethernet)
+        mac_addr = cls._normalize_mac(eth_pkt.src) if eth_pkt else 'unknown'
+        message = (
+            'DHCP address pool exhausted: no available IP for %s '
+            'in [%s, %s)' % (mac_addr, cls.start_ip, cls.end_ip)
+        )
+        cls.logger.warning(message)
+        print(message, flush=True)
 
     @classmethod
     def _send_packet(cls, datapath, port, pkt):
