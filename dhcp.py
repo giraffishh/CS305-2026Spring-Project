@@ -1,4 +1,5 @@
 # -*- coding: utf-8 -*-
+import logging
 import struct
 import time
 
@@ -22,6 +23,7 @@ class Config():
 
 
 class DHCPServer():
+    logger = logging.getLogger('DHCPServer')
     hardware_addr = Config.controller_macAddr
     start_ip = Config.start_ip
     end_ip = Config.end_ip
@@ -74,16 +76,32 @@ class DHCPServer():
         msg_type = cls._get_message_type(dhcp_pkt)
 
         if msg_type == dhcp.DHCP_DISCOVER:
-            cls._send_packet(datapath, port, cls.assemble_offer(pkt, datapath))
+            offer_pkt = cls.assemble_offer(pkt, datapath)
+            if offer_pkt is None:
+                cls._log_pool_exhausted(pkt)
+                offer_pkt = cls.assemble_nak(pkt)
+            cls._send_packet(datapath, port, offer_pkt)
         elif msg_type == dhcp.DHCP_REQUEST:
             ack_pkt = cls.assemble_ack(pkt, datapath, port)
             if ack_pkt is None:
+                cls._log_pool_exhausted(pkt)
                 ack_pkt = cls.assemble_nak(pkt)
             cls._send_packet(datapath, port, ack_pkt)
         elif msg_type == getattr(dhcp, 'DHCP_RELEASE', 7):
             cls._release_client(pkt)
         elif msg_type == getattr(dhcp, 'DHCP_DECLINE', 4):
             cls._decline_requested_ip(pkt)
+
+    @classmethod
+    def _log_pool_exhausted(cls, pkt):
+        eth_pkt = pkt.get_protocol(ethernet.ethernet)
+        mac_addr = cls._normalize_mac(eth_pkt.src) if eth_pkt else 'unknown'
+        message = (
+            'DHCP address pool exhausted: no available IP for %s '
+            'in [%s, %s)' % (mac_addr, cls.start_ip, cls.end_ip)
+        )
+        cls.logger.warning(message)
+        print(message, flush=True)
 
     @classmethod
     def _send_packet(cls, datapath, port, pkt):
