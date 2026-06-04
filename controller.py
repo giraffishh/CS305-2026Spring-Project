@@ -36,19 +36,35 @@ class ControllerApp(app_manager.OSKenApp):
 
     def __init__(self, *args, **kwargs):
         super(ControllerApp, self).__init__(*args, **kwargs)
-        # 维护当前在线交换机 datapath 对象，key 为交换机 dpid。
+        # ---------------- 全局拓扑状态 ----------------
+        # 这个控制器不依赖交换机自己做 MAC learning，而是在控制器里保存
+        # 一份全局网络视图。后面的 switch/link/host 事件处理函数都会更新
+        # 这些表，最短路计算和流表下发也都基于这些表完成。
+
+        # dpid -> datapath。datapath 是 os-ken 表示某台交换机 OpenFlow
+        # 连接的对象，控制器需要通过它向交换机发送 FlowMod、PacketOut 等消息。
         self.datapaths = {}
-        # 为每台交换机缓存对应的 OfCtl 封装，便于统一下发流表或报文。
+        # dpid -> OfCtl。OfCtl 是本项目封装的 OpenFlow 工具类，缓存起来后
+        # 安装流表、发送 ARP 包时不用反复创建。它依赖 datapath，但接口更方便。
         self.ofctls = {}
-        # 记录当前拓扑中已知的交换机集合。
+        # 当前控制器已经知道的交换机 dpid 集合。最短路算法会把这里的 dpid
+        # 当作图中的点；有些 dpid 可能先从拓扑事件学到，真正下发流表时仍会
+        # 检查 datapaths 中是否存在可用连接。
         self.switches = set()
-        # 邻接表形式的链路视图：links[src_dpid][dst_dpid] = src_port。
+        # 交换机之间的邻接表：links[src_dpid][dst_dpid] = src_port。
+        # 含义是：如果数据包在 src_dpid 上，下一跳要去 dst_dpid，就应该从
+        # src_port 这个端口发出。由于 Mininet 中交换机链路按无向边理解，
+        # _add_link 会同时写入两个方向。
         self.links = defaultdict(dict)
-        # 主机学习表：MAC -> {dpid, port, ip}。
+        # 主机位置表：MAC -> {dpid, port, ip}。dpid/port 表示该主机接在哪台
+        # 交换机的哪个端口，ip 用于 ARP 代答。这个表是“主机是图的叶子节点”
+        # 的关键来源。
         self.hosts_by_mac = {}
-        # ARP 学到的 IP/MAC 映射，用于快速响应 ARP 请求。
+        # IP -> MAC。控制器收到 ARP request 时，用目标 IP 查这个表；如果能
+        # 找到 MAC，就直接构造 ARP reply 返回给源主机，避免在全网广播 ARP。
         self.mac_by_ip = {}
-        # 已安装的目的 MAC 转发表项，避免重复下发。
+        # (dpid, dst_mac) -> out_port。记录已经安装过的目的 MAC 转发表项，
+        # 用来避免重复下发同一条规则，也方便拓扑变化后删除旧规则。
         self.installed_mac_flows = {}
         self.firewall = Firewall()
         # 保存上一次打印的路径快照，避免日志重复刷屏。
@@ -58,7 +74,9 @@ class ControllerApp(app_manager.OSKenApp):
 
     @set_ev_cls(ofp_event.EventOFPSwitchFeatures, CONFIG_DISPATCHER)
     def switch_features_handler(self, ev):
-        # 交换机刚连接控制器时，下发 table-miss，将未知报文送到控制器。
+        # EventOFPSwitchFeatures 是 OpenFlow 握手阶段的事件，说明交换机已经
+        # 和控制器建立连接。这里先把 datapath/OfCtl 放进全局状态表，这样
+        # 后续拓扑事件或 PacketIn 到来时，控制器能找到对应交换机并下发消息。
         datapath = ev.msg.datapath
         ofproto = datapath.ofproto
         parser = datapath.ofproto_parser
@@ -66,6 +84,9 @@ class ControllerApp(app_manager.OSKenApp):
         self.ofctls[datapath.id] = OfCtl.factory(datapath, self.logger)
         self.switches.add(datapath.id)
 
+        # 安装 table-miss 流表项：没有命中更高优先级规则的报文会被送到
+        # 控制器。DHCP、ARP 以及尚未安装路径规则的首批报文都依赖这条规则
+        # 触发 PacketIn。
         match = parser.OFPMatch()
         actions = [parser.OFPActionOutput(ofproto.OFPP_CONTROLLER)]
         mod = parser.OFPFlowMod(
@@ -87,7 +108,10 @@ class ControllerApp(app_manager.OSKenApp):
         """
         Event handler indicating a switch has come online.
         """
-        # 新交换机加入时更新本地拓扑缓存，并重新计算转发路径。
+        # os-ken 拓扑模块发现新交换机后会触发 EventSwitchEnter。这里做的
+        # 事情和 SwitchFeatures 类似：把交换机加入全局交换机集合，并缓存
+        # 控制通道对象。拓扑图多了一个点，所有主机对的最短路径都有可能
+        # 发生变化，所以最后调用 _recompute_paths。
         datapath = ev.switch.dp
         self.datapaths[datapath.id] = datapath
         self.ofctls[datapath.id] = OfCtl.factory(datapath, self.logger)
@@ -100,18 +124,25 @@ class ControllerApp(app_manager.OSKenApp):
         """
         Event handler indicating a switch has been removed
         """
-        # 交换机离线后清理相关状态，避免保留失效链路和主机信息。
+        # 交换机离线时，它对应的图节点、控制连接、相邻边、挂载在它上面的
+        # 主机都不再可信。这里按依赖关系逐项清理，避免最短路算法继续经过
+        # 一个不存在的交换机。
         dpid = ev.switch.dp.id
+        # 1. 从交换机集合和控制通道缓存中删除该 dpid。
         self.switches.discard(dpid)
         self.datapaths.pop(dpid, None)
         self.ofctls.pop(dpid, None)
+        # 2. 删除以该交换机为起点的所有边。
         self.links.pop(dpid, None)
+        # 3. 删除其他交换机邻接表中指向该交换机的边。
         for neighbors in self.links.values():
             neighbors.pop(dpid, None)
+        # 4. 删除接在该交换机上的主机位置记录。
         self.hosts_by_mac = {
             mac: host for mac, host in self.hosts_by_mac.items()
             if host["dpid"] != dpid
         }
+        # 5. 同步清理 IP->MAC 表，只保留仍然有位置记录的主机。
         self.mac_by_ip = {
             ip: mac for ip, mac in self.mac_by_ip.items()
             if mac in self.hosts_by_mac
@@ -125,7 +156,11 @@ class ControllerApp(app_manager.OSKenApp):
         Event handler indiciating a host has joined the network
         This handler is automatically triggered when a host sends an ARP response.
         """ 
-        # 主机接入后记录其接入交换机、端口和 IP，并刷新全网转发表。
+        # 主机在最短路图中不是中间节点，而是挂在某台交换机某个端口上的
+        # 叶子节点。os-ken 通过 gratuitous ARP 发现主机后，会给出 host.mac、
+        # host.port.dpid、host.port.port_no 和可能的 host.ipv4。控制器把这些
+        # 信息写入 hosts_by_mac/mac_by_ip，之后才能计算“去某个目的 MAC”时
+        # 每台交换机应该把包从哪个端口发出去。
         host = ev.host
         if not host.port:
             return
@@ -138,7 +173,10 @@ class ControllerApp(app_manager.OSKenApp):
         """
         Event handler indicating a link between two switches has been added
         """
-        # 链路加入后更新双向邻接关系。
+        # EventLinkAdd 表示 LLDP 拓扑发现模块发现了两台交换机之间的连接。
+        # link.src.port_no 是从 src 走向 dst 时应该使用的输出端口，
+        # link.dst.port_no 是反方向应该使用的输出端口。_add_link 会把这条
+        # 物理链路写成邻接表里的两个有向项，供最短路后的“下一跳端口”查询。
         link = ev.link
         self._add_link(link.src.dpid, link.dst.dpid,
                        link.src.port_no, link.dst.port_no)
@@ -149,7 +187,8 @@ class ControllerApp(app_manager.OSKenApp):
         """
         Event handler indicating when a link between two switches has been deleted
         """
-        # 链路删除后从邻接表中移除，并重新下发可达路径。
+        # 链路删除后，邻接表中的两个方向都必须移除。否则最短路算法可能
+        # 继续选择已经断开的边，导致控制器下发错误的输出端口。
         link = ev.link
         self._remove_link(link.src.dpid, link.dst.dpid)
         self._recompute_paths()
@@ -162,7 +201,10 @@ class ControllerApp(app_manager.OSKenApp):
         Event handler for when any switch port changes state.
         This includes links for hosts as well as links between switches.
         """
-        # 端口状态变化可能影响主机连通性或链路状态，因此统一触发重算。
+        # 端口 up/down 可能意味着主机断开、交换机间链路不可用，或端口号对应
+        # 的连通关系发生变化。这里不直接改拓扑表，因为真正的链路增删会由
+        # EventLinkAdd/EventLinkDelete 更新；此处触发一次重算，保证已有状态
+        # 被尽快反映到流表。
         self._recompute_paths()
 
 
@@ -192,11 +234,15 @@ class ControllerApp(app_manager.OSKenApp):
             self._handle_arp(datapath, in_port, pkt_arp, pkt_eth)
 
     def _handle_arp(self, datapath, in_port, pkt_arp, pkt_eth):
-        # 无论请求还是响应，先借助 ARP 源信息学习主机位置。
+        # ARP 报文天然携带源主机的 src_mac/src_ip，而且 PacketIn 告诉我们
+        # 它是从哪台交换机的哪个端口进来的。因此无论这是 ARP request 还是
+        # ARP reply，都可以用来刷新主机位置表。测试脚本启动时发送的
+        # gratuitous ARP 也会走到这里。
         self._learn_host(pkt_arp.src_mac, datapath.id, in_port, pkt_arp.src_ip)
 
         if pkt_arp.opcode == arp.ARP_REPLY:
-            # 收到 ARP 响应说明主机已经活跃，可据此重算路径。
+            # ARP reply 只用于学习主机信息；它本身不需要控制器再代答。学习后
+            # 立刻重算路径，使新主机对应的目的 MAC 流表尽快被安装。
             self._recompute_paths()
             return
 
@@ -226,7 +272,10 @@ class ControllerApp(app_manager.OSKenApp):
         self._recompute_paths()
 
     def _get_ofctl(self, datapath):
-        # 延迟初始化 OfCtl，确保任意已知 datapath 都能被统一操作。
+        # 有些路径会先拿到 datapath，却还没有在 switch_features_handler 或
+        # handle_switch_add 中创建 OfCtl。这里做懒加载，保证只要有 datapath，
+        # 就可以获得可用的 OpenFlow 操作封装。同时把 dpid 加入 switches，
+        # 让全局拓扑视图不会漏掉这台交换机。
         if datapath.id not in self.ofctls:
             self.datapaths[datapath.id] = datapath
             self.ofctls[datapath.id] = OfCtl.factory(datapath, self.logger)
@@ -234,27 +283,39 @@ class ControllerApp(app_manager.OSKenApp):
         return self.ofctls[datapath.id]
 
     def _learn_host(self, mac, dpid, port_no, ip_addr=None):
-        # 更新主机位置；如果主机迁移到新端口，这里会直接覆盖旧记录。
+        # 把一个主机绑定到“接入交换机 dpid + 接入端口 port_no”。
+        # 如果同一个 MAC 后续从另一个端口出现，直接覆盖旧记录，相当于支持
+        # 主机迁移或重复学习。最短路转发只关心目的主机当前位置，所以保留
+        # 最新位置是合理的。
         if not mac:
             return
+        # 主机接入的交换机也一定是拓扑中的交换机节点。这里补充 add 一次，
+        # 可以容忍事件到达顺序不同：即使 HostAdd/ARP 先于 SwitchEnter 到达，
+        # 后续计算也能看到这个 dpid。
         self.switches.add(dpid)
         self.hosts_by_mac[mac] = {
             "dpid": dpid,
             "port": port_no,
             "ip": ip_addr
         }
+        # 只有拿到有效 IP 时才更新 ARP 查询表。ARP 代答依赖 IP->MAC，
+        # 而路径流表下发依赖 MAC->位置，两张表的用途不同。
         if ip_addr:
             self.mac_by_ip[ip_addr] = mac
 
     def _add_link(self, src_dpid, dst_dpid, src_port, dst_port):
-        # 控制器内部使用无向图表示交换机之间链路，因此双向写入。
+        # 把交换机链路加入控制器内部的图。图的节点是交换机 dpid，边是
+        # 交换机之间的连接；边上保存的是“从当前交换机去邻居交换机应该
+        # 使用哪个输出端口”。这个端口信息会在 _output_port_to_host 中用于
+        # 把最短路的下一跳转换成 OpenFlow action output。
         self.switches.add(src_dpid)
         self.switches.add(dst_dpid)
         self.links[src_dpid][dst_dpid] = src_port
         self.links[dst_dpid][src_dpid] = dst_port
 
     def _remove_link(self, src_dpid, dst_dpid):
-        # 删除链路时同样要清除双向邻接信息。
+        # 删除链路时同时删除两个方向。使用 pop(..., None) 是为了容忍事件
+        # 重复到达或只记录了一侧方向的情况，不因为缺少 key 让控制器崩溃。
         self.links[src_dpid].pop(dst_dpid, None)
         self.links[dst_dpid].pop(src_dpid, None)
 
@@ -345,7 +406,7 @@ class ControllerApp(app_manager.OSKenApp):
 
     def _recompute_paths(self):
         # 根据当前拓扑和主机学习结果，重新整理每台交换机的目的 MAC 转发规则。
-        desired_flows = {}
+        desired_flows = {} # 流标格式： (dpid, dst_mac) -> out_port
         for dst_mac, dst_host in list(self.hosts_by_mac.items()):
             for src_dpid in list(self.switches):
                 datapath = self.datapaths.get(src_dpid)
