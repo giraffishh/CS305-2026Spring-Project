@@ -234,6 +234,7 @@ class DHCPServer():
         if client_ip:
             cls._reserve_offer(mac_addr, client_ip, dhcp_pkt.xid)
         return client_ip
+     
 
     @classmethod
     def _confirm_requested_ip(cls, pkt):
@@ -375,6 +376,10 @@ class DHCPServer():
             ip_addr = cls._int_to_ip_text(ip_int)
             if cls._ip_is_available_for_mac(ip_addr, mac_addr):
                 return ip_addr
+           # ====== 新增：当扫描完整个地址池都没有可用 IP 时，控制台输出红色警告 ======
+        print("\033[91m[DHCP WARNING] Address Pool Exhausted! No available IP for MAC: %s\033[0m" % mac_addr)
+        # ===================================================================
+    
         return None
 
     @classmethod
